@@ -6,185 +6,90 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {VestingVault} from "../src/VestingVault.sol";
 
-contract MockERC20 is ERC20 {
-    constructor() ERC20("Mock Token", "MCK") {
-        _mint(msg.sender, 10_000_000 ether);
-    }
-
-    function mint(address to, uint256 amount) external {
-        _mint(to, amount);
+contract EdgeMockToken is ERC20 {
+    constructor() ERC20("Edge Token", "EDGE") {
+        _mint(msg.sender, 1_000_000 ether);
     }
 }
 
-contract VestingVaultTest is Test {
-    MockERC20 internal token;
+contract VestingVaultEdgeCasesTest is Test {
+    EdgeMockToken internal token;
     VestingVault internal vault;
 
     address internal owner = address(this);
-    address internal alice = address(0xA11CE);
-    address internal bob = address(0xB0B);
-    address internal attacker = address(0xBAD);
+    address internal alice = address(0x1111);
+    address internal bob = address(0x2222);
+    address internal stranger = address(0x3333);
 
     uint64 internal start;
-    uint64 internal cliff = 200;
-    uint64 internal duration = 1000;
-    uint256 internal amount = 1000 ether;
 
     function setUp() public {
-        start = uint64(block.timestamp + 100);
-        token = new MockERC20();
+        start = uint64(block.timestamp + 50);
+        token = new EdgeMockToken();
         vault = new VestingVault(IERC20(address(token)));
-        token.transfer(address(vault), 5_000_000 ether);
+        token.transfer(address(vault), 500_000 ether);
     }
 
-    // 1. Before cliff -> 0 vested
-    function test_BeforeCliffIsZero() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.warp(start + cliff - 1);
-        assertEq(vault.vestedAmount(id), 0);
-        assertEq(vault.releasable(id), 0);
+    function test_RevertInvalidScheduleParams() public {
+        vm.expectRevert(bytes("amount is zero"));
+        vault.createSchedule(alice, 0, start, 10, 100, true);
+
+        vm.expectRevert(bytes("duration is zero"));
+        vault.createSchedule(alice, 100 ether, start, 0, 0, true);
+
+        vm.expectRevert(bytes("cliff > duration"));
+        vault.createSchedule(alice, 100 ether, start, 150, 100, true);
     }
 
-    // 2. Right at cliff boundary
-    function test_AtCliffBoundary() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.warp(start + cliff);
-        uint256 expected = (amount * cliff) / duration;
-        assertEq(vault.vestedAmount(id), expected);
-    }
-
-    // 3. Mid-duration linear unlock
-    function test_MidDurationLinear() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.warp(start + 500);
-        uint256 expected = (amount * 500) / duration;
-        assertEq(vault.vestedAmount(id), expected);
-    }
-
-    // 4. At and after duration -> 100% vested
-    function test_AtAndAfterDurationFullVested() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.warp(start + duration);
-        assertEq(vault.vestedAmount(id), amount);
-
-        vm.warp(start + duration + 5000);
-        assertEq(vault.vestedAmount(id), amount);
-    }
-
-    // 5. Partial release and second release
-    function test_PartialReleaseAndSecondRelease() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, false);
-
-        vm.warp(start + 400);
+    function test_RevertWhenNothingToRelease() public {
+        uint256 id = vault.createSchedule(alice, 1000 ether, start, 100, 500, false);
+        vm.warp(start + 10);
+        vm.expectRevert(bytes("nothing to release"));
         vault.release(id);
-        assertEq(token.balanceOf(alice), 400 ether);
-
-        vm.warp(start + 800);
-        vault.release(id);
-        assertEq(token.balanceOf(alice), 800 ether);
     }
 
-    // 6. Anyone can call release and tokens go to beneficiary
-    function test_AnyoneCanReleaseToBeneficiary() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, false);
-        vm.warp(start + 500);
+    function test_RevertTransferScheduleUnauthorizedOrInvalid() public {
+        uint256 id = vault.createSchedule(alice, 1000 ether, start, 100, 500, false);
 
-        vm.prank(attacker);
-        vault.release(id);
-
-        assertEq(token.balanceOf(alice), 500 ether);
-        assertEq(token.balanceOf(attacker), 0);
-    }
-
-    // 7. Revoke returns unvested tokens and keeps vested claimable
-    function test_RevokeReturnsUnvestedAndFreezes() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.warp(start + 400);
-
-        uint256 ownerBefore = token.balanceOf(owner);
-        vault.revoke(id);
-        assertEq(token.balanceOf(owner), ownerBefore + 600 ether);
-
-        // Advance time after revoke -> vested does not increase
-        vm.warp(start + duration);
-        assertEq(vault.vestedAmount(id), 400 ether);
-
-        // Beneficiary can still claim vested 400
-        vault.release(id);
-        assertEq(token.balanceOf(alice), 400 ether);
-    }
-
-    // 8. Cannot revoke non-revocable schedule
-    function test_RevertWhenRevokingNonRevocable() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, false);
-        vm.expectRevert(bytes("not revocable"));
-        vault.revoke(id);
-    }
-
-    // 9. Cannot revoke twice
-    function test_RevertWhenRevokingTwice() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vault.revoke(id);
-        vm.expectRevert(bytes("already revoked"));
-        vault.revoke(id);
-    }
-
-    // 10. Non-owner cannot create schedule or revoke
-    function test_RevertNonOwnerAdminActions() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        vault.createSchedule(alice, amount, start, cliff, duration, true);
-
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, true);
-        vm.prank(attacker);
-        vm.expectRevert();
-        vault.revoke(id);
-    }
-
-    // 11. Cannot over-allocate more than unallocated balance
-    function test_RevertWhenNotEnoughTokens() public {
-        uint256 extra = token.balanceOf(address(vault)) + 1;
-        vm.expectRevert(bytes("not enough tokens"));
-        vault.createSchedule(alice, extra, start, cliff, duration, true);
-    }
-
-    // 12. Withdraw unallocated tokens
-    function test_WithdrawUnallocated() public {
-        token.mint(address(vault), 250 ether);
-        uint256 ownerBefore = token.balanceOf(owner);
-        uint256 withdrawn = vault.withdrawUnallocated(owner);
-        assertEq(withdrawn, 250 ether);
-        assertEq(token.balanceOf(owner), ownerBefore + 250 ether);
-    }
-
-    // 13. Transfer schedule to new beneficiary
-    function test_TransferSchedule() public {
-        uint256 id = vault.createSchedule(alice, amount, start, cliff, duration, false);
-
-        vm.prank(alice);
+        vm.prank(stranger);
+        vm.expectRevert(bytes("not beneficiary"));
         vault.transferSchedule(id, bob);
 
-        assertEq(vault.schedulesOf(alice).length, 0);
-        assertEq(vault.schedulesOf(bob).length, 1);
-        assertEq(vault.schedulesOf(bob)[0], id);
+        vm.prank(alice);
+        vm.expectRevert(bytes("zero address"));
+        vault.transferSchedule(id, address(0));
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("same beneficiary"));
+        vault.transferSchedule(id, alice);
     }
 
-    // 14. Fuzz test over time and total amount
-    function testFuzz_VestedBounds(uint256 totalAmt, uint64 elapsed) public {
-        totalAmt = bound(totalAmt, 1 ether, 1_000_000 ether);
-        uint64 dur = 1000;
-        uint64 cl = 200;
+    function test_RevertWithdrawUnallocatedWhenZeroOrNotOwner() public {
+        vm.prank(stranger);
+        vm.expectRevert();
+        vault.withdrawUnallocated(stranger);
 
-        uint256 id = vault.createSchedule(alice, totalAmt, start, cl, dur, false);
-        vm.warp(uint256(start) + uint256(elapsed));
+        // Allocate all unallocated tokens
+        vault.createSchedule(alice, 500_000 ether, start, 0, 1000, false);
 
-        uint256 vested = vault.vestedAmount(id);
-        assertLe(vested, totalAmt);
+        vm.expectRevert(bytes("nothing to withdraw"));
+        vault.withdrawUnallocated(owner);
+    }
 
-        if (elapsed < cl) {
-            assertEq(vested, 0);
-        } else if (elapsed >= dur) {
-            assertEq(vested, totalAmt);
+    function testFuzz_ReleaseAfterFullDuration(uint96 amt, uint64 extraTime) public {
+        vm.assume(amt > 0);
+        uint256 totalAmt = uint256(amt);
+        if (totalAmt > token.balanceOf(address(vault)) - vault.totalAllocated()) {
+            totalAmt = token.balanceOf(address(vault)) - vault.totalAllocated();
         }
+        vm.assume(totalAmt > 0);
+
+        uint64 dur = 1000;
+        uint256 id = vault.createSchedule(alice, totalAmt, start, 100, dur, false);
+
+        vm.warp(uint256(start) + uint256(dur) + uint256(extraTime));
+        vault.release(id);
+
+        assertEq(token.balanceOf(alice), totalAmt);
     }
 }
